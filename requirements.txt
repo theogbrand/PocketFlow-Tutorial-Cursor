@@ -4,3 +4,6 @@ anthropic>=0.21.0
 python-dotenv>=1.0.1
 typing_extensions>=4.0.0
 litellm>=1.0.0
+openai
+google-generativeai
+Pillow

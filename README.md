@@ -1,7 +1,5 @@
 TODO: 
-* Run this with Visual Inputs
-* See if can work with Distilled R1 models
-* Include custom tools from Cantor
+1. See if can work with Distilled R1 models
 
 <h1 align="center">Build Cursor with Cursor</h1>
 

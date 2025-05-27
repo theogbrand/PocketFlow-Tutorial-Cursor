@@ -1,3 +1,8 @@
+TODO: 
+* Run this with Visual Inputs
+* See if can work with Distilled R1 models
+* Include custom tools from Cantor
+
 <h1 align="center">Build Cursor with Cursor</h1>
 
 Cursor is cool! But what if we use it to build an open-source, customizable AI coding agent? We’ll develop a “Cursor Agent” that writes, reviews, and refactors code—right within Cursor itself. It’s meta, it’s moddable, and it’s powered by the power of Cursor. Let’s build Cursor…with Cursor.

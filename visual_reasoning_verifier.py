@@ -383,8 +383,11 @@ class VerificationSynthesisNode(Node):
                 verification_summary += f"   Error: {step['result']}\n"
             verification_summary += "\n"
         
-        # Create synthesis prompt
-        prompt = f"""You are a verification agent evaluating the validity of an intermediate reasoning step in a multimodal task.
+        # Maximum retry attempts for proper YAML response
+        max_retries = 3
+        for attempt in range(max_retries):
+            # Create synthesis prompt
+            prompt = f"""You are a verification agent evaluating the validity of an intermediate reasoning step in a multimodal task.
 
 Reasoning Step to Verify: "{reasoning_step}"
 
@@ -398,46 +401,66 @@ Consider:
 3. Does it contain any errors or misconceptions about what's in the image?
 4. If the step makes claims about the image, are they supported by the evidence?
 
-Provide your judgment in the following format:
+YOU MUST RESPOND USING THE EXACT YAML FORMAT BELOW. This is critical for automated processing:
 ```yaml
 valid: true/false (boolean)
 confidence: a value between 0.0 and 1.0
 explanation: |
   Detailed explanation of your judgment, citing specific evidence from the verification results
-```"""
+```
 
-        # Generate synthesis
-        response = call_llm(prompt)
-        
-        # Extract YAML
-        yaml_content = ""
-        if "```yaml" in response:
-            yaml_blocks = response.split("```yaml")
-            if len(yaml_blocks) > 1:
-                yaml_content = yaml_blocks[1].split("```")[0].strip()
-        elif "```yml" in response:
-            yaml_blocks = response.split("```yml")
-            if len(yaml_blocks) > 1:
-                yaml_content = yaml_blocks[1].split("```")[0].strip()
-        
-        if yaml_content:
-            judgment = yaml.safe_load(yaml_content)
+Your entire response must be in this YAML format with these exact fields."""
+
+            # Generate synthesis
+            response = call_llm(prompt)
             
-            # Validate fields
-            assert "valid" in judgment, "Valid judgment is missing"
-            assert isinstance(judgment["valid"], bool), "Valid must be a boolean"
-            assert "confidence" in judgment, "Confidence is missing"
-            assert "explanation" in judgment, "Explanation is missing"
+            # Extract YAML
+            yaml_content = ""
+            if "```yaml" in response:
+                yaml_blocks = response.split("```yaml")
+                if len(yaml_blocks) > 1:
+                    yaml_content = yaml_blocks[1].split("```")[0].strip()
+            elif "```yml" in response:
+                yaml_blocks = response.split("```yml")
+                if len(yaml_blocks) > 1:
+                    yaml_content = yaml_blocks[1].split("```")[0].strip()
+            # If no code blocks, try using the whole response
+            elif not yaml_content and response.strip():
+                yaml_content = response.strip()
             
-            return judgment
-        else:
-            # Fallback if YAML parsing fails
-            logger.warning("YAML parsing failed, using fallback judgment")
-            return {
-                "valid": False,
-                "confidence": 0.5,
-                "explanation": "Unable to parse judgment properly. The verification process completed but produced inconclusive results."
-            }
+            try:
+                if yaml_content:
+                    judgment = yaml.safe_load(yaml_content)
+                    
+                    # Validate fields
+                    if "valid" not in judgment:
+                        logger.warning(f"Attempt {attempt+1}: 'valid' field missing from YAML response")
+                        continue
+                    if not isinstance(judgment["valid"], bool):
+                        logger.warning(f"Attempt {attempt+1}: 'valid' field is not a boolean")
+                        continue
+                    if "confidence" not in judgment:
+                        logger.warning(f"Attempt {attempt+1}: 'confidence' field missing from YAML response")
+                        continue
+                    if "explanation" not in judgment:
+                        logger.warning(f"Attempt {attempt+1}: 'explanation' field missing from YAML response")
+                        continue
+                    
+                    # All validations passed
+                    logger.info(f"Successfully parsed YAML response on attempt {attempt+1}")
+                    return judgment
+                else:
+                    logger.warning(f"Attempt {attempt+1}: No YAML content found in response")
+            except yaml.YAMLError as e:
+                logger.warning(f"Attempt {attempt+1}: YAML parsing error: {e}")
+        
+        # Fallback if all retries fail
+        logger.error(f"Failed to get valid YAML response after {max_retries} attempts")
+        return {
+            "valid": False,
+            "confidence": 0.5,
+            "explanation": f"Unable to parse judgment properly after {max_retries} attempts. The verification process completed but produced inconclusive results."
+        }
     
     def post(self, shared: Dict[str, Any], prep_res: Any, exec_res: Dict[str, Any]) -> str:
         # Format the judgment for output
@@ -449,7 +472,8 @@ explanation: |
             "valid": exec_res["valid"],
             "confidence": exec_res["confidence"],
             "explanation": exec_res["explanation"],
-            "formatted_judgment": final_judgment
+            "formatted_judgment": final_judgment,
+            "raw_yaml": yaml.dump(exec_res)  # Include raw YAML for direct parsing
         }
         
         logger.info(f"VerificationSynthesisNode: Final judgment - Valid: {exec_res['valid']}, Confidence: {exec_res['confidence']}")
@@ -497,7 +521,8 @@ def create_verification_flow() -> Flow:
 def verify_reasoning_step(
     reasoning_step: str, 
     image_path: str, 
-    gemini_api_key: str = None
+    gemini_api_key: str = None,
+    max_attempts: int = 1
 ) -> Dict[str, Any]:
     """
     Verify the validity of a reasoning step against an image.
@@ -506,6 +531,7 @@ def verify_reasoning_step(
         reasoning_step: The intermediate reasoning step to verify
         image_path: Path to the image file
         gemini_api_key: Google Gemini API key (defaults to environment variable)
+        max_attempts: Maximum number of verification attempts to ensure valid output
     
     Returns:
         Dictionary containing verification result and metadata
@@ -521,33 +547,64 @@ def verify_reasoning_step(
     if not os.path.exists(image_path):
         raise ValueError(f"Image file not found: {image_path}")
     
-    # Initialize shared state
-    shared = {
-        "reasoning_step": reasoning_step,
-        "image_path": image_path,
-        "gemini_api_key": gemini_api_key,
-        "verification_history": [],
-        "verification_result": None
-    }
+    # Try verification multiple times if needed to ensure valid output
+    for attempt in range(max_attempts):
+        # Initialize shared state
+        shared = {
+            "reasoning_step": reasoning_step,
+            "image_path": image_path,
+            "gemini_api_key": gemini_api_key,
+            "verification_history": [],
+            "verification_result": None
+        }
+        
+        # Create and run the flow
+        flow = create_verification_flow()
+        flow.run(shared)
+        
+        # Check if verification result is valid
+        verification_result = shared.get("verification_result", {})
+        
+        # Verify we have a valid result with all required fields
+        if (verification_result and 
+            "valid" in verification_result and 
+            "confidence" in verification_result and 
+            "explanation" in verification_result):
+            
+            final_judgment = verification_result.get("formatted_judgment", "$No$")
+            raw_yaml = verification_result.get("raw_yaml", "")
+            
+            # Return successful result
+            return {
+                "reasoning_step": reasoning_step,
+                "image_path": image_path,
+                "valid": verification_result.get("valid", False),
+                "confidence": verification_result.get("confidence", 0.0),
+                "explanation": verification_result.get("explanation", ""),
+                "final_judgment": final_judgment,
+                "raw_yaml": raw_yaml,
+                "verification_history": shared.get("verification_history", []),
+                "success": True,
+                "attempt": attempt + 1
+            }
+        
+        logger.warning(f"Verification attempt {attempt+1}/{max_attempts} failed to produce valid result")
+        if attempt < max_attempts - 1:
+            logger.info(f"Retrying verification...")
     
-    # Create and run the flow
-    flow = create_verification_flow()
-    flow.run(shared)
-    
-    # Format final judgment
-    verification_result = shared.get("verification_result", {})
-    final_judgment = verification_result.get("formatted_judgment", "$No$")
-    
-    # Return results
+    # If we reach here, all attempts failed
+    logger.error(f"All {max_attempts} verification attempts failed")
     return {
         "reasoning_step": reasoning_step,
         "image_path": image_path,
-        "valid": verification_result.get("valid", False),
-        "confidence": verification_result.get("confidence", 0.0),
-        "explanation": verification_result.get("explanation", "Verification failed"),
-        "final_judgment": final_judgment,
+        "valid": False,
+        "confidence": 0.0,
+        "explanation": f"Failed to verify reasoning step after {max_attempts} attempts",
+        "final_judgment": "$No$",
+        "raw_yaml": "",
         "verification_history": shared.get("verification_history", []),
-        "success": verification_result is not None
+        "success": False,
+        "attempt": max_attempts
     }
 
 def main():
@@ -563,6 +620,12 @@ def main():
                         help="Google Gemini API key (defaults to GEMINI_API_KEY env var)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable verbose logging")
+    parser.add_argument("--max-attempts", "-m", type=int, default=3,
+                        help="Maximum number of verification attempts (default: 3)")
+    parser.add_argument("--output", "-o", type=str,
+                        help="Output file path for YAML results (optional)")
+    parser.add_argument("--format", "-f", type=str, choices=["yaml", "json", "text"], default="text",
+                        help="Output format (default: text)")
     
     args = parser.parse_args()
     
@@ -575,33 +638,65 @@ def main():
         result = verify_reasoning_step(
             reasoning_step=args.step,
             image_path=args.image,
-            gemini_api_key=args.api_key
+            gemini_api_key=args.api_key,
+            max_attempts=args.max_attempts
         )
         
-        # Print results
-        print("\n" + "="*60)
-        print("VISUAL REASONING VERIFICATION RESULTS")
-        print("="*60)
-        print(f"\nReasoning Step: {result['reasoning_step']}")
-        print(f"Image: {result['image_path']}")
-        print(f"\nVerdict: {result['valid']}")
-        print(f"Confidence: {result['confidence']}")
-        print(f"Explanation: {result['explanation']}")
-        print(f"\nFinal Judgment: {result['final_judgment']}")
-        
-        if args.verbose and result['verification_history']:
-            print(f"\n\nDetailed Verification History:")
-            print("-" * 40)
-            for i, step in enumerate(result['verification_history']):
-                print(f"\nStep {i+1}: {step['module']}")
-                print(f"Task: {step['task']}")
-                print(f"Success: {step['success']}")
-                if step['success']:
-                    print(f"Result: {step['result']}")
-                else:
-                    print(f"Error: {step['result']}")
-        
-        print("\n" + "="*60)
+        # Format output based on requested format
+        if args.format == "yaml":
+            output_content = result.get("raw_yaml", yaml.dump(result))
+            if args.output:
+                with open(args.output, 'w') as f:
+                    f.write(output_content)
+                print(f"Results written to {args.output} in YAML format")
+            else:
+                print(output_content)
+        elif args.format == "json":
+            import json
+            output_content = json.dumps(result, indent=2)
+            if args.output:
+                with open(args.output, 'w') as f:
+                    f.write(output_content)
+                print(f"Results written to {args.output} in JSON format")
+            else:
+                print(output_content)
+        else:  # text format
+            # Print results in human-readable format
+            print("\n" + "="*60)
+            print("VISUAL REASONING VERIFICATION RESULTS")
+            print("="*60)
+            print(f"\nReasoning Step: {result['reasoning_step']}")
+            print(f"Image: {result['image_path']}")
+            print(f"\nVerdict: {result['valid']}")
+            print(f"Confidence: {result['confidence']}")
+            print(f"Explanation: {result['explanation']}")
+            print(f"\nFinal Judgment: {result['final_judgment']}")
+            
+            if "attempt" in result:
+                print(f"\nVerification completed in {result['attempt']} attempt(s)")
+            
+            if args.verbose and result['verification_history']:
+                print(f"\n\nDetailed Verification History:")
+                print("-" * 40)
+                for i, step in enumerate(result['verification_history']):
+                    print(f"\nStep {i+1}: {step['module']}")
+                    print(f"Task: {step['task']}")
+                    print(f"Success: {step['success']}")
+                    if step['success']:
+                        print(f"Result: {step['result']}")
+                    else:
+                        print(f"Error: {step['result']}")
+            
+            print("\n" + "="*60)
+            
+            # If output file specified, write the raw YAML
+            if args.output:
+                with open(args.output, 'w') as f:
+                    if "raw_yaml" in result and result["raw_yaml"]:
+                        f.write(result["raw_yaml"])
+                    else:
+                        f.write(yaml.dump(result))
+                print(f"Results also written to {args.output}")
         
     except Exception as e:
         logger.error(f"Error in verification: {e}")

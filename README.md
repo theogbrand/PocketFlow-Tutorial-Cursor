@@ -1,5 +1,6 @@
 TODO: 
-1. See if can work with Distilled R1 models
+1. change job from solver to verifier, output is Yes/No
+2. See if can work with Distilled R1 models
 
 <h1 align="center">Build Cursor with Cursor</h1>
 
